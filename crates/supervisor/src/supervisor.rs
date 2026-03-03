@@ -37,10 +37,13 @@ use pince_protocol::{
     UserMessage,
 };
 
+use pince_protocol::auth;
+
 use crate::{
     agent_handle::{AgentHandle, AgentSharedState, AgentStatus},
     audit::{AuditEntry, AuditLog, Decision},
     config::Config,
+    spawn,
 };
 
 /// A pending tool call waiting for frontend approval.
@@ -74,6 +77,7 @@ pub struct Supervisor {
     config: Config,
     audit: Arc<AuditLog>,
     agents: HashMap<String, Arc<AgentHandle>>,
+    children: HashMap<String, tokio::process::Child>,
     frontends: HashMap<String, mpsc::Sender<SupervisorFrontendMessage>>,
     pending_approvals: HashMap<String, PendingApproval>,
     auth_token: String,
@@ -87,6 +91,7 @@ impl Supervisor {
             config,
             audit,
             agents: HashMap::new(),
+            children: HashMap::new(),
             frontends: HashMap::new(),
             pending_approvals: HashMap::new(),
             auth_token,
@@ -128,7 +133,7 @@ impl Supervisor {
                 self.frontends.insert(id, tx);
             }
             Event::FrontendMessage(id, msg) => {
-                self.on_frontend_message(id, msg).await?;
+                self.on_frontend_message(id, msg, _ev_tx).await?;
             }
             Event::FrontendDisconnected(id) => {
                 tracing::info!(frontend_id = %id, "frontend disconnected");
@@ -178,6 +183,7 @@ impl Supervisor {
         &mut self,
         id: String,
         msg: FrontendMessage,
+        _ev_tx: &mpsc::Sender<Event>,
     ) -> Result<()> {
         match msg.msg {
             Some(FrontMsg::Auth(auth)) => {
@@ -247,11 +253,78 @@ impl Supervisor {
             }
 
             Some(FrontMsg::SpawnAgent(_spawn)) => {
-                tracing::warn!("SpawnAgent not yet implemented");
+                let agent_id = Uuid::new_v4().to_string();
+                let ev_tx = _ev_tx.clone();
+                let heartbeat_timeout =
+                    Duration::from_secs(self.config.heartbeat_timeout_secs);
+
+                match spawn::spawn_agent(&agent_id) {
+                    Ok(spawned) => {
+                        tracing::info!(agent_id = %agent_id, "agent process spawned");
+                        self.children.insert(agent_id.clone(), spawned.child);
+
+                        // Authenticate and wire up the agent connection in a background task.
+                        let token = spawned.auth_token;
+                        tokio::spawn(async move {
+                            let mut stream = spawned.stream;
+
+                            // Validate auth token from agent.
+                            if let Err(e) = auth::recv_auth_token(&mut stream, &token).await {
+                                tracing::error!(agent_id = %agent_id, "agent auth failed: {e}");
+                                let _ = ev_tx.send(Event::AgentDied(agent_id)).await;
+                                return;
+                            }
+                            tracing::debug!(agent_id = %agent_id, "agent authenticated");
+
+                            handle_agent_connection(
+                                agent_id,
+                                stream,
+                                ev_tx,
+                                heartbeat_timeout,
+                            )
+                            .await;
+                        });
+                    }
+                    Err(e) => {
+                        tracing::error!("failed to spawn agent: {e}");
+                        self.send_to(
+                            &id,
+                            SupervisorFrontendMessage {
+                                msg: Some(SupFrontMsg::Error(frontend_types::FrontendError {
+                                    message: format!("failed to spawn agent: {e}"),
+                                })),
+                            },
+                        )
+                        .await;
+                    }
+                }
             }
 
-            Some(FrontMsg::KillAgent(_kill)) => {
-                tracing::warn!("KillAgent not yet implemented");
+            Some(FrontMsg::KillAgent(kill)) => {
+                let agent_id = &kill.agent_id;
+                if let Some(handle) = self.agents.get(agent_id) {
+                    // Send Shutdown message to the agent.
+                    let shutdown_msg = SupervisorMessage {
+                        msg: Some(SupMsg::Shutdown(pince_protocol::Shutdown {})),
+                    };
+                    let _ = handle.send(shutdown_msg).await;
+                    tracing::info!(agent_id = %agent_id, "sent shutdown to agent");
+                }
+                // Kill the child process if it's still running.
+                if let Some(mut child) = self.children.remove(agent_id) {
+                    let _ = child.kill().await;
+                    tracing::info!(agent_id = %agent_id, "killed agent process");
+                }
+                self.agents.remove(agent_id);
+                self.broadcast_frontend(SupervisorFrontendMessage {
+                    msg: Some(SupFrontMsg::AgentStatusChange(
+                        frontend_types::AgentStatusChange {
+                            agent_id: agent_id.clone(),
+                            status: frontend_types::AgentStatus::Dead.into(),
+                        },
+                    )),
+                })
+                .await;
             }
 
             None => {
@@ -505,8 +578,7 @@ async fn handle_frontend_connection(
 }
 
 /// Connect an agent socket to the supervisor event loop.
-/// Called by the supervisor when it accepts a connection on the agent socket.
-#[allow(dead_code)]
+/// Called after auth succeeds on a spawned agent's socketpair.
 pub(crate) async fn handle_agent_connection(
     agent_id: String,
     stream: tokio::net::UnixStream,
