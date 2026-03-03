@@ -1,0 +1,8 @@
+services:
+  devenv:
+    image: ${DENV_IMAGE:-pince-denv}
+    environment:
+      - LOCAL_UID=$LOCAL_UID
+      - LOCAL_GID=$LOCAL_GID
+    volumes:
+      - ../:/workspace

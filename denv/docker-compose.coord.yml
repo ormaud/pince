@@ -1,0 +1,6 @@
+services:
+  devenv:
+    extends:
+      file: docker-compose.base.yml
+      service: devenv
+    command: ["sleep", "infinity"]

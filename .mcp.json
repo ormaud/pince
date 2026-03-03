@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "devenv": {
+      "command": "bash",
+      "args": ["denv/mcp.sh"]
+    },
+    "trame": {
+      "type": "url",
+      "url": "https://trame.sh/mcp"
+    }
+  }
+}
