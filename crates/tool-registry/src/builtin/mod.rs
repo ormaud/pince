@@ -1,9 +1,12 @@
 //! Built-in tool implementations.
 
+pub mod feedback;
 pub mod list_files;
 pub mod read_file;
 pub mod shell_exec;
 pub mod write_file;
+
+pub use feedback::FeedbackConfig;
 
 use std::path::{Path, PathBuf};
 
@@ -63,7 +66,7 @@ impl ProtectedPaths {
     }
 }
 
-/// Helper: register all built-in tools into a registry.
+/// Helper: register all built-in tools (except optional ones) into a registry.
 pub fn register_all(registry: &mut crate::ToolRegistry, protected: ProtectedPaths) {
     use std::sync::Arc;
 
@@ -84,5 +87,16 @@ pub fn register_all(registry: &mut crate::ToolRegistry, protected: ProtectedPath
     registry.register(
         shell_exec::schema(),
         Box::new(shell_exec::ShellExecHandler { protected }),
+    );
+}
+
+/// Register the optional `feedback` tool into the registry.
+///
+/// This is separate from `register_all` because it requires external
+/// configuration (Trame API URL and secret store).
+pub fn register_feedback(registry: &mut crate::ToolRegistry, config: FeedbackConfig) {
+    registry.register(
+        feedback::schema(),
+        Box::new(feedback::FeedbackHandler { config }),
     );
 }

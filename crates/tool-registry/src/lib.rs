@@ -10,6 +10,8 @@ pub mod registry;
 pub mod schema;
 pub mod validate;
 
+pub use builtin::FeedbackConfig;
+pub use builtin::register_feedback;
 pub use config::ToolRegistryConfig;
 pub use registry::{RegisteredTool, ToolRegistry};
 pub use schema::{RiskLevel, ToolSchema};
