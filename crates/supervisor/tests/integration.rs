@@ -34,6 +34,8 @@ async fn start_supervisor(dir: &TempDir) -> (std::path::PathBuf, String) {
         auth_token_file: token_file,
         audit_log,
         heartbeat_timeout_secs: 10,
+        config_file: dir.path().join("supervisor.toml"),
+        cron_jobs: Vec::new(),
     };
 
     tokio::spawn(async move {

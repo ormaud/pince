@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -39,10 +39,13 @@ use pince_protocol::{
 
 use pince_protocol::auth;
 
+use pince_scheduler::{DueJob, Scheduler};
+
 use crate::{
     agent_handle::{AgentHandle, AgentSharedState, AgentStatus},
     audit::{AuditEntry, AuditLog, Decision},
     config::Config,
+    health,
     spawn,
 };
 
@@ -70,6 +73,8 @@ pub(crate) enum Event {
         agent_id: String,
         handle: Arc<AgentHandle>,
     },
+    /// A cron job is due — spawn a headless agent and send it the prompt.
+    ScheduledJob(DueJob),
 }
 
 /// The supervisor process.
@@ -81,12 +86,19 @@ pub struct Supervisor {
     frontends: HashMap<String, mpsc::Sender<SupervisorFrontendMessage>>,
     pending_approvals: HashMap<String, PendingApproval>,
     auth_token: String,
+    /// Agents spawned by the scheduler: agent_id → job name.
+    headless_agents: HashMap<String, String>,
+    /// Monotonic start time for uptime calculation.
+    started_at: Instant,
+    /// Number of registered (enabled) cron jobs.
+    scheduler_jobs: usize,
 }
 
 impl Supervisor {
     pub async fn new(config: Config) -> Result<Self> {
         let auth_token = load_or_create_token(&config.auth_token_file).await?;
         let audit = Arc::new(AuditLog::new(config.audit_log.clone()));
+        let scheduler_jobs = config.cron_jobs.len();
         Ok(Self {
             config,
             audit,
@@ -95,6 +107,9 @@ impl Supervisor {
             frontends: HashMap::new(),
             pending_approvals: HashMap::new(),
             auth_token,
+            headless_agents: HashMap::new(),
+            started_at: Instant::now(),
+            scheduler_jobs,
         })
     }
 
@@ -117,6 +132,28 @@ impl Supervisor {
             tokio::spawn(accept_frontends(listener, ev_tx, heartbeat_timeout));
         }
 
+        // Scheduler task: only start if there are cron jobs configured.
+        if !self.config.cron_jobs.is_empty() {
+            let (sched_tx, mut sched_rx) = mpsc::channel::<DueJob>(32);
+            let jobs = self.config.cron_jobs.clone();
+            tokio::spawn(async move {
+                let mut scheduler = Scheduler::new(jobs, sched_tx);
+                scheduler.run().await;
+            });
+
+            // Bridge: forward DueJob → Event::ScheduledJob.
+            let ev_tx_bridge = ev_tx.clone();
+            tokio::spawn(async move {
+                while let Some(job) = sched_rx.recv().await {
+                    if ev_tx_bridge.send(Event::ScheduledJob(job)).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            tracing::info!(jobs = self.config.cron_jobs.len(), "scheduler started");
+        }
+
         // Main event loop.
         while let Some(event) = ev_rx.recv().await {
             if let Err(e) = self.handle_event(event, &ev_tx).await {
@@ -126,14 +163,14 @@ impl Supervisor {
         Ok(())
     }
 
-    async fn handle_event(&mut self, event: Event, _ev_tx: &mpsc::Sender<Event>) -> Result<()> {
+    async fn handle_event(&mut self, event: Event, ev_tx: &mpsc::Sender<Event>) -> Result<()> {
         match event {
             Event::FrontendConnected { id, tx } => {
                 tracing::info!(frontend_id = %id, "frontend connected");
                 self.frontends.insert(id, tx);
             }
             Event::FrontendMessage(id, msg) => {
-                self.on_frontend_message(id, msg, _ev_tx).await?;
+                self.on_frontend_message(id, msg, ev_tx).await?;
             }
             Event::FrontendDisconnected(id) => {
                 tracing::info!(frontend_id = %id, "frontend disconnected");
@@ -161,7 +198,11 @@ impl Supervisor {
                 self.on_agent_message(id, msg).await?;
             }
             Event::AgentDied(id) => {
-                tracing::warn!(agent_id = %id, "agent died");
+                let job_name = self.headless_agents.remove(&id);
+                tracing::warn!(agent_id = %id, job = ?job_name, "agent died");
+                if let Some(name) = &job_name {
+                    self.log_scheduled_outcome(&id, name, "died").await;
+                }
                 self.agents.remove(&id);
                 self.broadcast_frontend(SupervisorFrontendMessage {
                     msg: Some(SupFrontMsg::AgentStatusChange(
@@ -173,8 +214,78 @@ impl Supervisor {
                 })
                 .await;
             }
+            Event::ScheduledJob(job) => {
+                self.on_scheduled_job(job, ev_tx).await?;
+            }
         }
         Ok(())
+    }
+
+    // ── Scheduled job handler ─────────────────────────────────────────────────
+
+    async fn on_scheduled_job(&mut self, job: DueJob, ev_tx: &mpsc::Sender<Event>) -> Result<()> {
+        tracing::info!(job = %job.name, "cron job triggered, spawning agent");
+
+        let agent_id = Uuid::new_v4().to_string();
+        let heartbeat_timeout = Duration::from_secs(self.config.heartbeat_timeout_secs);
+
+        match spawn::spawn_agent(&agent_id) {
+            Ok(spawned) => {
+                tracing::info!(agent_id = %agent_id, job = %job.name, "headless agent spawned");
+                self.children.insert(agent_id.clone(), spawned.child);
+                self.headless_agents.insert(agent_id.clone(), job.name.clone());
+
+                // Authenticate and wire up the agent.
+                let token = spawned.auth_token;
+                let ev_tx2 = ev_tx.clone();
+                let agent_id2 = agent_id.clone();
+                let prompt = job.prompt.clone();
+                tokio::spawn(async move {
+                    let mut stream = spawned.stream;
+                    if let Err(e) = auth::recv_auth_token(&mut stream, &token).await {
+                        tracing::error!(agent_id = %agent_id2, "headless agent auth failed: {e}");
+                        let _ = ev_tx2.send(Event::AgentDied(agent_id2)).await;
+                        return;
+                    }
+                    // Wire up the connection, then send the initial prompt via AgentReady.
+                    handle_agent_connection_with_prompt(
+                        agent_id2,
+                        stream,
+                        ev_tx2,
+                        heartbeat_timeout,
+                        Some(prompt),
+                    )
+                    .await;
+                });
+
+                // Watchdog: kill the agent if it runs too long.
+                let timeout_secs = job.timeout_secs;
+                let ev_tx3 = ev_tx.clone();
+                let agent_id3 = agent_id.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(timeout_secs)).await;
+                    tracing::warn!(agent_id = %agent_id3, timeout = timeout_secs, "headless agent timed out");
+                    let _ = ev_tx3.send(Event::AgentDied(agent_id3)).await;
+                });
+            }
+            Err(e) => {
+                tracing::error!(job = %job.name, "failed to spawn headless agent: {e}");
+            }
+        }
+        Ok(())
+    }
+
+    async fn log_scheduled_outcome(&self, agent_id: &str, job_name: &str, outcome: &str) {
+        let entry = AuditEntry::new(
+            agent_id.to_string(),
+            "scheduled_job",
+            format!("job={job_name}"),
+            Decision::Allow,
+            outcome.to_string(),
+        );
+        if let Err(e) = self.audit.append(entry).await {
+            tracing::error!("audit log: {e}");
+        }
     }
 
     // ── Frontend message handler ───────────────────────────────────────────────
@@ -183,7 +294,7 @@ impl Supervisor {
         &mut self,
         id: String,
         msg: FrontendMessage,
-        _ev_tx: &mpsc::Sender<Event>,
+        ev_tx: &mpsc::Sender<Event>,
     ) -> Result<()> {
         match msg.msg {
             Some(FrontMsg::Auth(auth)) => {
@@ -254,7 +365,7 @@ impl Supervisor {
 
             Some(FrontMsg::SpawnAgent(_spawn)) => {
                 let agent_id = Uuid::new_v4().to_string();
-                let ev_tx = _ev_tx.clone();
+                let ev_tx = ev_tx.clone();
                 let heartbeat_timeout =
                     Duration::from_secs(self.config.heartbeat_timeout_secs);
 
@@ -316,6 +427,7 @@ impl Supervisor {
                     tracing::info!(agent_id = %agent_id, "killed agent process");
                 }
                 self.agents.remove(agent_id);
+                self.headless_agents.remove(agent_id);
                 self.broadcast_frontend(SupervisorFrontendMessage {
                     msg: Some(SupFrontMsg::AgentStatusChange(
                         frontend_types::AgentStatusChange {
@@ -360,7 +472,29 @@ impl Supervisor {
             }
 
             Some(AgentMsg::ToolCall(tool_call)) => {
-                self.handle_tool_call(agent_id, tool_call).await?;
+                // Handle supervisor_health inline — no frontend approval needed.
+                if tool_call.tool == health::TOOL_NAME {
+                    let report = health::HealthReport {
+                        uptime_secs: self.started_at.elapsed().as_secs(),
+                        active_agents: self.agents.len(),
+                        connected_frontends: self.frontends.len(),
+                        scheduler_jobs: self.scheduler_jobs,
+                        scheduler_enabled: self.scheduler_jobs > 0,
+                    };
+                    let result_json = serde_json::to_vec(&report).unwrap_or_default();
+                    if let Some(h) = self.agents.get(&agent_id) {
+                        let _ = h
+                            .send(SupervisorMessage {
+                                msg: Some(SupMsg::ToolResult(ToolCallResult {
+                                    request_id: tool_call.request_id,
+                                    result_json,
+                                })),
+                            })
+                            .await;
+                    }
+                } else {
+                    self.handle_tool_call(agent_id, tool_call).await?;
+                }
             }
 
             Some(AgentMsg::Response(chunk)) => {
@@ -379,19 +513,31 @@ impl Supervisor {
             }
 
             Some(AgentMsg::ResponseDone(_)) => {
+                let is_headless = self.headless_agents.contains_key(&agent_id);
                 if let Some(h) = self.agents.get(&agent_id) {
                     h.set_status(AgentStatus::Ready).await;
                 }
-                self.broadcast_frontend(SupervisorFrontendMessage {
-                    msg: Some(SupFrontMsg::AgentResponseDone(
-                        frontend_types::AgentResponseDone { agent_id },
-                    )),
-                })
-                .await;
+                if is_headless {
+                    // Log completion and clean up.
+                    let job_name = self.headless_agents.remove(&agent_id).unwrap_or_default();
+                    tracing::info!(agent_id = %agent_id, job = %job_name, "scheduled agent finished");
+                    self.log_scheduled_outcome(&agent_id, &job_name, "completed").await;
+                } else {
+                    self.broadcast_frontend(SupervisorFrontendMessage {
+                        msg: Some(SupFrontMsg::AgentResponseDone(
+                            frontend_types::AgentResponseDone { agent_id },
+                        )),
+                    })
+                    .await;
+                }
             }
 
             Some(AgentMsg::Error(err)) => {
                 tracing::error!(agent_id = %agent_id, "agent error: {}", err.message);
+                let job_name = self.headless_agents.remove(&agent_id);
+                if let Some(name) = &job_name {
+                    self.log_scheduled_outcome(&agent_id, name, "error").await;
+                }
                 self.agents.remove(&agent_id);
                 self.broadcast_frontend(SupervisorFrontendMessage {
                     msg: Some(SupFrontMsg::AgentStatusChange(
@@ -437,6 +583,7 @@ impl Supervisor {
 
         // Register pending approval.
         let (resolve_tx, resolve_rx) = tokio::sync::oneshot::channel::<ApprovalDecision>();
+        let tool_name = tool_call.tool.clone();
         self.pending_approvals.insert(
             request_id.clone(),
             PendingApproval {
@@ -448,11 +595,6 @@ impl Supervisor {
 
         // Spawn resolver task.
         let audit = self.audit.clone();
-        let tool_name = self
-            .pending_approvals
-            .get(&request_id)
-            .map(|p| p.tool_call.tool.clone())
-            .unwrap_or_default();
         let agents = self.agents.clone();
 
         tokio::spawn(async move {
@@ -585,11 +727,21 @@ pub(crate) async fn handle_agent_connection(
     ev_tx: mpsc::Sender<Event>,
     heartbeat_timeout: Duration,
 ) {
+    handle_agent_connection_with_prompt(agent_id, stream, ev_tx, heartbeat_timeout, None).await;
+}
+
+/// Like `handle_agent_connection` but sends an initial prompt once the agent is ready.
+async fn handle_agent_connection_with_prompt(
+    agent_id: String,
+    stream: tokio::net::UnixStream,
+    ev_tx: mpsc::Sender<Event>,
+    heartbeat_timeout: Duration,
+    initial_prompt: Option<String>,
+) {
     let shared = AgentSharedState::new(agent_id.clone());
     let (msg_tx, mut msg_rx) = mpsc::channel::<SupervisorMessage>(64);
-    let handle = AgentHandle::new(shared.clone(), msg_tx);
+    let handle = AgentHandle::new(shared.clone(), msg_tx.clone());
 
-    // Notify the supervisor.
     let _ = ev_tx
         .send(Event::AgentConnected {
             agent_id: agent_id.clone(),
@@ -599,7 +751,6 @@ pub(crate) async fn handle_agent_connection(
 
     let (mut reader, mut writer) = stream.into_split();
 
-    // Writer task.
     let writer_agent_id = agent_id.clone();
     tokio::spawn(async move {
         while let Some(msg) = msg_rx.recv().await {
@@ -611,12 +762,27 @@ pub(crate) async fn handle_agent_connection(
     });
 
     // Reader loop with heartbeat watchdog.
+    let mut prompt_sent = initial_prompt.is_none();
     let mut check_interval = time::interval(Duration::from_secs(5));
     loop {
         tokio::select! {
             result = codec::read_message::<AgentMessage, _>(&mut reader) => {
                 match result {
                     Ok(msg) => {
+                        // When the agent becomes ready, send the initial prompt (headless mode).
+                        if !prompt_sent {
+                            if let Some(AgentMsg::Ready(_)) = &msg.msg {
+                                if let Some(ref prompt) = initial_prompt {
+                                    let user_msg = SupervisorMessage {
+                                        msg: Some(SupMsg::UserMessage(UserMessage {
+                                            content: prompt.clone(),
+                                        })),
+                                    };
+                                    let _ = msg_tx.send(user_msg).await;
+                                    prompt_sent = true;
+                                }
+                            }
+                        }
                         if matches!(msg.msg, Some(AgentMsg::Heartbeat(_))) {
                             *shared.last_heartbeat.lock().await = tokio::time::Instant::now();
                         }
