@@ -6,6 +6,7 @@
 pub mod builtin;
 pub mod config;
 pub mod mcp;
+pub mod memory;
 pub mod registry;
 pub mod schema;
 pub mod validate;
