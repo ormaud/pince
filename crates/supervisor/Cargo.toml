@@ -1,0 +1,28 @@
+[package]
+name = "supervisor"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "supervisor_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pince-supervisor"
+path = "src/main.rs"
+
+[dependencies]
+pince-protocol = { path = "../protocol" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = "3"
