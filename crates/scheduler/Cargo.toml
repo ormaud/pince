@@ -1,0 +1,14 @@
+[package]
+name = "pince-scheduler"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cron = "0.15"
+tokio = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
