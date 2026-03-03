@@ -114,12 +114,15 @@ impl ToolHandler for MemorySearchHandler {
                 .as_str()
                 .ok_or_else(|| ToolError::InvalidArguments("missing 'query'".into()))?;
 
-            let collection = args["collection"].as_str();
+            let collection = match args["collection"].as_str() {
+                Some(c) => Some(normalize_path(c)?),
+                None => None,
+            };
             let limit = args["limit"].as_u64().map(|v| v as u32);
 
             let results = self
                 .backend
-                .search(query, collection, limit)
+                .search(query, collection.as_deref(), limit)
                 .await
                 .map_err(ToolError::ExecutionFailed)?;
 
@@ -212,7 +215,7 @@ pub fn memory_store_schema() -> ToolSchema {
             "required": ["path", "content"],
             "additionalProperties": false
         }),
-        RiskLevel::Safe,
+        RiskLevel::Sensitive,
     )
 }
 
@@ -285,7 +288,18 @@ impl ToolHandler for MemoryListHandler {
         args: Value,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + 'a>> {
         Box::pin(async move {
-            let pattern = args["pattern"].as_str();
+            let pattern = match args["pattern"].as_str() {
+                Some(p) => {
+                    // Reject path traversal in glob patterns.
+                    if p.contains("..") {
+                        return Err(ToolError::InvalidArguments(format!(
+                            "path traversal not allowed in pattern: '{p}'"
+                        )));
+                    }
+                    Some(p)
+                }
+                None => None,
+            };
 
             let docs = self
                 .backend
