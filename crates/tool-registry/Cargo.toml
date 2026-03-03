@@ -1,5 +1,5 @@
 [package]
-name = "permission-engine"
+name = "tool-registry"
 version = "0.1.0"
 edition = "2021"
 
@@ -12,10 +12,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 toml = { workspace = true }
-glob = { workspace = true }
-regex = { workspace = true }
-notify = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
-tempfile = "3"
+tempfile = { workspace = true }
+serde_json = { workspace = true }

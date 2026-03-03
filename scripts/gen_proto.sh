@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regenerate protobuf bindings from proto/agent.proto.
+# Regenerate protobuf bindings from proto/agent.proto and proto/frontend.proto.
 # Usage: scripts/gen_proto.sh [--protoc /path/to/protoc]
 set -euo pipefail
 
@@ -17,7 +17,8 @@ echo "Generating Python bindings..."
 "$PROTOC" \
     --proto_path="${ROOT}/proto" \
     --python_out="${ROOT}/agent/pince_proto" \
-    "${ROOT}/proto/agent.proto"
+    "${ROOT}/proto/agent.proto" \
+    "${ROOT}/proto/frontend.proto"
 
 echo "Python bindings generated in agent/pince_proto/"
 echo ""

@@ -1,6 +1,6 @@
-# pince_proto - Generated protobuf types for the pince agent-supervisor protocol.
+# pince_proto - Generated protobuf types for the pince protocol.
 #
-# Generated from proto/agent.proto using protoc.
+# Generated from proto/agent.proto and proto/frontend.proto using protoc.
 # Do not edit by hand — regenerate with: scripts/gen_proto.sh
 from . import agent_pb2
 from .agent_pb2 import (
@@ -23,7 +23,32 @@ from .agent_pb2 import (
     RiskLevel,
 )
 
+from . import frontend_pb2
+from .frontend_pb2 import (
+    FrontendMessage,
+    SupervisorFrontendMessage,
+    Auth,
+    AuthResult,
+    SendMessage,
+    ApprovalResponse,
+    ApprovalDecision,
+    ListAgents,
+    SpawnAgent,
+    KillAgent,
+    AgentResponseChunk,
+    AgentResponseDone,
+    ToolCallEvent,
+    ToolResultEvent,
+    ApprovalRequest,
+    AgentList,
+    AgentInfo,
+    AgentStatus,
+    AgentStatusChange,
+    FrontendError,
+)
+
 __all__ = [
+    # agent types
     "agent_pb2",
     "AgentMessage",
     "SupervisorMessage",
@@ -42,4 +67,26 @@ __all__ = [
     "Cancel",
     "Shutdown",
     "RiskLevel",
+    # frontend types
+    "frontend_pb2",
+    "FrontendMessage",
+    "SupervisorFrontendMessage",
+    "Auth",
+    "AuthResult",
+    "SendMessage",
+    "ApprovalResponse",
+    "ApprovalDecision",
+    "ListAgents",
+    "SpawnAgent",
+    "KillAgent",
+    "AgentResponseChunk",
+    "AgentResponseDone",
+    "ToolCallEvent",
+    "ToolResultEvent",
+    "ApprovalRequest",
+    "AgentList",
+    "AgentInfo",
+    "AgentStatus",
+    "AgentStatusChange",
+    "FrontendError",
 ]

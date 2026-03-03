@@ -8,8 +8,12 @@ fn main() {
 
     prost_build::Config::new()
         .out_dir(&out_dir)
-        .compile_protos(&[proto_root.join("agent.proto")], &[&proto_root])
+        .compile_protos(
+            &[proto_root.join("agent.proto"), proto_root.join("frontend.proto")],
+            &[&proto_root],
+        )
         .expect("failed to compile proto files");
 
     println!("cargo:rerun-if-changed=../../proto/agent.proto");
+    println!("cargo:rerun-if-changed=../../proto/frontend.proto");
 }

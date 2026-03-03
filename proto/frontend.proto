@@ -1,0 +1,136 @@
+syntax = "proto3";
+package pince.frontend;
+
+import "agent.proto";
+
+// Messages sent from a frontend client to the supervisor.
+message FrontendMessage {
+  oneof msg {
+    Auth auth = 1;
+    SendMessage send_message = 2;
+    ApprovalResponse approval_response = 3;
+    ListAgents list_agents = 4;
+    SpawnAgent spawn_agent = 5;
+    KillAgent kill_agent = 6;
+  }
+}
+
+// Messages sent from the supervisor to a frontend client.
+message SupervisorFrontendMessage {
+  oneof msg {
+    AuthResult auth_result = 1;
+    AgentResponseChunk agent_response = 2;
+    AgentResponseDone agent_response_done = 3;
+    ToolCallEvent tool_call_event = 4;
+    ToolResultEvent tool_result_event = 5;
+    ApprovalRequest approval_request = 6;
+    AgentList agent_list = 7;
+    AgentStatusChange agent_status_change = 8;
+    FrontendError error = 9;
+  }
+}
+
+// Frontend → Supervisor: authenticate the connection.
+message Auth {
+  string token = 1;
+}
+
+// Supervisor → Frontend: authentication result.
+message AuthResult {
+  bool success = 1;
+  string error = 2;
+}
+
+// Frontend → Supervisor: send a user message to an agent.
+message SendMessage {
+  string content = 1;
+  string agent_id = 2;  // optional, empty = default agent
+}
+
+// Frontend → Supervisor: respond to an approval request.
+message ApprovalResponse {
+  string request_id = 1;
+  ApprovalDecision decision = 2;
+}
+
+enum ApprovalDecision {
+  APPROVE_ONCE = 0;
+  APPROVE_SESSION = 1;
+  DENY = 2;
+}
+
+// Frontend → Supervisor: list active agents.
+message ListAgents {}
+
+// Frontend → Supervisor: spawn a new agent.
+message SpawnAgent {
+  string agent_type = 1;
+}
+
+// Frontend → Supervisor: kill an agent.
+message KillAgent {
+  string agent_id = 1;
+}
+
+// Supervisor → Frontend: streamed agent response chunk.
+message AgentResponseChunk {
+  string agent_id = 1;
+  string content = 2;
+}
+
+// Supervisor → Frontend: agent finished responding.
+message AgentResponseDone {
+  string agent_id = 1;
+}
+
+// Supervisor → Frontend: a sub-agent requested a tool call.
+message ToolCallEvent {
+  string agent_id = 1;
+  string request_id = 2;
+  string tool = 3;
+  bytes arguments_json = 4;
+}
+
+// Supervisor → Frontend: result of a tool call.
+message ToolResultEvent {
+  string request_id = 1;
+  bytes result_json = 2;
+}
+
+// Supervisor → Frontend: approval needed from the user.
+message ApprovalRequest {
+  string request_id = 1;
+  string agent_id = 2;
+  string tool = 3;
+  bytes arguments_json = 4;
+  pince.agent.RiskLevel risk_level = 5;
+}
+
+// Supervisor → Frontend: list of currently active agents.
+message AgentList {
+  repeated AgentInfo agents = 1;
+}
+
+message AgentInfo {
+  string agent_id = 1;
+  string agent_type = 2;
+  AgentStatus status = 3;
+}
+
+enum AgentStatus {
+  INITIALIZING = 0;
+  READY = 1;
+  BUSY = 2;
+  DEAD = 3;
+}
+
+// Supervisor → Frontend: an agent's status changed.
+message AgentStatusChange {
+  string agent_id = 1;
+  AgentStatus status = 2;
+}
+
+// Supervisor → Frontend: generic error.
+message FrontendError {
+  string message = 1;
+}
