@@ -1,0 +1,88 @@
+syntax = "proto3";
+package pince.agent;
+
+message AgentMessage {
+  oneof msg {
+    Ready ready = 1;
+    ToolCallRequest tool_call = 2;
+    ResponseChunk response = 3;
+    ResponseDone response_done = 4;
+    AgentError error = 5;
+    Heartbeat heartbeat = 6;
+  }
+}
+
+message SupervisorMessage {
+  oneof msg {
+    Init init = 1;
+    UserMessage user_message = 2;
+    ToolCallResult tool_result = 3;
+    ToolCallDenied tool_denied = 4;
+    Cancel cancel = 5;
+    Shutdown shutdown = 6;
+  }
+}
+
+message Ready {}
+
+message ToolCallRequest {
+  string request_id = 1;
+  string tool = 2;
+  bytes arguments_json = 3;  // JSON-encoded tool arguments
+}
+
+message ResponseChunk {
+  string content = 1;
+}
+
+message ResponseDone {}
+
+message AgentError {
+  string message = 1;
+}
+
+message Heartbeat {}
+
+message Init {
+  AgentConfig config = 1;
+}
+
+message AgentConfig {
+  string agent_id = 1;
+  string model = 2;
+  string provider = 3;
+  string system_prompt = 4;
+  repeated ToolSchema tools = 5;
+  uint32 max_tokens = 6;
+  float temperature = 7;
+}
+
+message ToolSchema {
+  string name = 1;
+  string description = 2;
+  bytes input_schema_json = 3;  // JSON Schema as bytes
+  RiskLevel risk_level = 4;
+}
+
+enum RiskLevel {
+  SAFE = 0;
+  SENSITIVE = 1;
+  DANGEROUS = 2;
+}
+
+message UserMessage {
+  string content = 1;
+}
+
+message ToolCallResult {
+  string request_id = 1;
+  bytes result_json = 2;
+}
+
+message ToolCallDenied {
+  string request_id = 1;
+  string reason = 2;
+}
+
+message Cancel {}
+message Shutdown {}
