@@ -12,8 +12,11 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 toml = { workspace = true }
+secrets = { path = "../secrets" }
+reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
+mockito = { workspace = true }

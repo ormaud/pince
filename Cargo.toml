@@ -31,3 +31,5 @@ notify = "6"
 tempfile = "3"
 libc = "0.2"
 getrandom = "0.2"
+reqwest = { version = "0.12", default-features = false }
+mockito = "1"
