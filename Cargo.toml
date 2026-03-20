@@ -7,6 +7,7 @@ members = [
     "crates/tool-registry",
     "crates/supervisor",
     "crates/scheduler",
+    "crates/sandbox",
 ]
 resolver = "2"
 

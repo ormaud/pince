@@ -971,6 +971,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "pince-sandbox"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "pince-scheduler"
 version = "0.1.0"
 dependencies = [
