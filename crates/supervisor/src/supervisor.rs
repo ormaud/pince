@@ -38,6 +38,7 @@ use pince_protocol::{
     ToolCallResult,
     ToolCallDenied,
     UserMessage,
+    RiskLevel as ProtoRiskLevel,
 };
 
 use pince_protocol::auth;
@@ -668,9 +669,30 @@ impl Supervisor {
         let tool_name = tool_call.tool.clone();
         let args_summary = String::from_utf8_lossy(&tool_call.arguments_json).to_string();
 
-        // 1. Parse and validate arguments.
+        // 1. Parse arguments.
         let args_value: serde_json::Value =
             serde_json::from_slice(&tool_call.arguments_json).unwrap_or(serde_json::Value::Null);
+
+        // 1b. Validate arguments against tool schema.
+        if let Err(validation_err) = self.tool_registry.validate(&tool_name, &args_value) {
+            tracing::warn!(agent_id = %agent_id, tool = %tool_name, "argument validation failed: {validation_err}");
+            let denied_msg = SupervisorMessage {
+                msg: Some(SupMsg::ToolDenied(ToolCallDenied {
+                    request_id,
+                    reason: validation_err.to_string(),
+                })),
+            };
+            if let Some(h) = self.agents.get(&agent_id) {
+                let _ = h.send(denied_msg).await;
+            }
+            let entry = AuditEntry::new(
+                &agent_id, &tool_name, &args_summary, Decision::Deny, "invalid arguments",
+            );
+            if let Err(e) = self.audit.append(entry).await {
+                tracing::error!("audit log: {e}");
+            }
+            return Ok(());
+        }
 
         // 2. Evaluate policy.
         let policy_action = self
@@ -1081,9 +1103,9 @@ async fn build_visible_tools(
             continue;
         }
         let risk_level = match schema.risk_level {
-            RegistryRiskLevel::Safe => 0,      // ProtoRiskLevel::Safe
-            RegistryRiskLevel::Sensitive => 1, // ProtoRiskLevel::Sensitive
-            RegistryRiskLevel::Dangerous => 2, // ProtoRiskLevel::Dangerous
+            RegistryRiskLevel::Safe => ProtoRiskLevel::Safe as i32,
+            RegistryRiskLevel::Sensitive => ProtoRiskLevel::Sensitive as i32,
+            RegistryRiskLevel::Dangerous => ProtoRiskLevel::Dangerous as i32,
         };
         visible.push(pince_protocol::ToolSchema {
             name: schema.name,
