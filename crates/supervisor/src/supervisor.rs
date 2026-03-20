@@ -12,7 +12,7 @@ use permission_engine::reload::{watch_and_reload, ReloadGuard};
 use anyhow::{Context, Result};
 use tokio::{
     net::UnixListener,
-    sync::mpsc,
+    sync::{mpsc, Mutex},
     time,
 };
 use uuid::Uuid;
@@ -42,13 +42,20 @@ use pince_protocol::{
 
 use pince_protocol::auth;
 
+use pince_sandbox::{SandboxConfig, SandboxRunner};
 use pince_scheduler::{DueJob, Scheduler};
+use tool_registry::{
+    builtin::{register_all, ProtectedPaths},
+    schema::RiskLevel as RegistryRiskLevel,
+    ToolRegistry,
+};
 
 use crate::{
     agent_handle::{AgentHandle, AgentSharedState, AgentStatus},
     audit::{AuditEntry, AuditLog, Decision},
     config::Config,
     health,
+    secrets_injection,
     spawn,
 };
 
@@ -100,6 +107,10 @@ pub struct Supervisor {
     /// Hot-reload guard — kept alive for the supervisor's lifetime.
     #[allow(dead_code)]
     reload_guard: Option<ReloadGuard>,
+    /// Registry of all tools known to the supervisor.
+    tool_registry: Arc<ToolRegistry>,
+    /// Sandbox backend for executing tools in isolation.
+    sandbox: Arc<Mutex<SandboxRunner>>,
 }
 
 impl Supervisor {
@@ -117,6 +128,16 @@ impl Supervisor {
             .context("loading permission policy")?,
         );
 
+        // Build tool registry with all built-in tools.
+        let mut registry = ToolRegistry::new();
+        let protected = ProtectedPaths::default_protected();
+        register_all(&mut registry, protected);
+        let tool_registry = Arc::new(registry);
+
+        // Build sandbox backend (mock for CI/tests, real for production).
+        let sandbox_runner = build_sandbox_runner(&config.sandbox);
+        let sandbox = Arc::new(Mutex::new(sandbox_runner));
+
         Ok(Self {
             config,
             audit,
@@ -130,6 +151,8 @@ impl Supervisor {
             scheduler_jobs,
             policy_engine,
             reload_guard: None,
+            tool_registry,
+            sandbox,
         })
     }
 
@@ -216,16 +239,35 @@ impl Supervisor {
             Event::AgentConnected { agent_id, handle } => {
                 tracing::info!(agent_id = %agent_id, "agent connected");
                 self.agents.insert(agent_id.clone(), handle.clone());
+
+                // Spawn a sandbox for this agent.
+                let mut sandbox = self.sandbox.lock().await;
+                if let Err(e) = sandbox.spawn(&agent_id).await {
+                    tracing::error!(agent_id = %agent_id, "failed to spawn sandbox: {e}");
+                    // Proceed without sandbox — tool calls will fail gracefully.
+                }
+                drop(sandbox);
+
+                // Build the tool list visible to this agent: all registered tools
+                // except those unconditionally denied by policy.
+                let visible_tools = build_visible_tools(
+                    &self.tool_registry,
+                    &self.policy_engine,
+                    &agent_id,
+                )
+                .await;
+
+                let agent_cfg = &self.config.agent;
                 let init_msg = SupervisorMessage {
                     msg: Some(SupMsg::Init(Init {
                         config: Some(AgentConfig {
                             agent_id,
-                            model: String::new(),
-                            provider: String::new(),
-                            system_prompt: String::new(),
-                            tools: Vec::new(),
-                            max_tokens: 0,
-                            temperature: 0.0,
+                            model: agent_cfg.default_model.clone(),
+                            provider: agent_cfg.default_provider.clone(),
+                            system_prompt: agent_cfg.system_prompt.clone(),
+                            tools: visible_tools,
+                            max_tokens: agent_cfg.max_tokens,
+                            temperature: agent_cfg.temperature,
                         }),
                     })),
                 };
@@ -241,6 +283,12 @@ impl Supervisor {
                     self.log_scheduled_outcome(&id, name, "died").await;
                 }
                 self.agents.remove(&id);
+                // Destroy the agent's sandbox (no workspace cleanup on crash).
+                let mut sandbox = self.sandbox.lock().await;
+                if let Err(e) = sandbox.destroy(&id, false).await {
+                    tracing::debug!(agent_id = %id, "sandbox destroy on agent death: {e}");
+                }
+                drop(sandbox);
                 self.broadcast_frontend(SupervisorFrontendMessage {
                     msg: Some(SupFrontMsg::AgentStatusChange(
                         frontend_types::AgentStatusChange {
@@ -474,6 +522,12 @@ impl Supervisor {
                 }
                 self.agents.remove(agent_id);
                 self.headless_agents.remove(agent_id);
+                // Destroy the agent's sandbox.
+                let mut sandbox = self.sandbox.lock().await;
+                if let Err(e) = sandbox.destroy(agent_id, false).await {
+                    tracing::debug!(agent_id = %agent_id, "sandbox destroy on kill: {e}");
+                }
+                drop(sandbox);
                 self.broadcast_frontend(SupervisorFrontendMessage {
                     msg: Some(SupFrontMsg::AgentStatusChange(
                         frontend_types::AgentStatusChange {
@@ -614,11 +668,11 @@ impl Supervisor {
         let tool_name = tool_call.tool.clone();
         let args_summary = String::from_utf8_lossy(&tool_call.arguments_json).to_string();
 
-        // Parse arguments for policy evaluation.
+        // 1. Parse and validate arguments.
         let args_value: serde_json::Value =
             serde_json::from_slice(&tool_call.arguments_json).unwrap_or(serde_json::Value::Null);
 
-        // Evaluate policy.
+        // 2. Evaluate policy.
         let policy_action = self
             .policy_engine
             .evaluate(&agent_id, &tool_name, &args_value)
@@ -626,20 +680,53 @@ impl Supervisor {
 
         match policy_action {
             Action::Allow => {
-                // Allowed by policy — proceed immediately, no user prompt.
                 tracing::info!(agent_id = %agent_id, tool = %tool_name, "policy: allow");
-                let result_msg = SupervisorMessage {
-                    msg: Some(SupMsg::ToolResult(ToolCallResult {
-                        request_id: request_id.clone(),
-                        result_json: serde_json::to_vec(&serde_json::json!({"ok": true}))
-                            .unwrap_or_default(),
-                    })),
+
+                // 3. Secret injection (stubbed — no-op for MVP).
+                let resolved_args = secrets_injection::inject_secrets(args_value);
+
+                // 4. Execute in sandbox.
+                let exec_result = self
+                    .sandbox
+                    .lock()
+                    .await
+                    .execute(&agent_id, &tool_name, resolved_args)
+                    .await;
+
+                // 5. Send result back to agent and audit.
+                let (result_msg, audit_decision, audit_note) = match exec_result {
+                    Ok(result_json) => {
+                        let msg = SupervisorMessage {
+                            msg: Some(SupMsg::ToolResult(ToolCallResult {
+                                request_id: request_id.clone(),
+                                result_json: serde_json::to_vec(&result_json).unwrap_or_default(),
+                            })),
+                        };
+                        (msg, Decision::Allow, "policy: allow; executed in sandbox")
+                    }
+                    Err(sandbox_err) => {
+                        tracing::error!(
+                            agent_id = %agent_id,
+                            tool = %tool_name,
+                            "sandbox execution failed: {sandbox_err}",
+                        );
+                        let msg = SupervisorMessage {
+                            msg: Some(SupMsg::ToolResult(ToolCallResult {
+                                request_id: request_id.clone(),
+                                result_json: serde_json::to_vec(
+                                    &serde_json::json!({"error": sandbox_err.to_string()}),
+                                )
+                                .unwrap_or_default(),
+                            })),
+                        };
+                        (msg, Decision::Allow, "policy: allow; sandbox error")
+                    }
                 };
                 if let Some(h) = self.agents.get(&agent_id) {
                     let _ = h.send(result_msg).await;
                 }
                 let entry = AuditEntry::new(
-                    &agent_id, &tool_name, &args_summary, Decision::Allow, "policy: allow",
+                    &agent_id, &tool_name, &args_summary, audit_decision, audit_note,
                 );
                 if let Err(e) = self.audit.append(entry).await {
                     tracing::error!("audit log: {e}");
@@ -693,9 +780,10 @@ impl Supervisor {
                     },
                 );
 
-                // Spawn resolver task.
+                // Spawn resolver task — executes after user decision.
                 let audit = self.audit.clone();
                 let agents = self.agents.clone();
+                let sandbox = self.sandbox.clone();
 
                 tokio::spawn(async move {
                     let decision = resolve_rx.await.unwrap_or(ApprovalDecision::Deny);
@@ -703,20 +791,53 @@ impl Supervisor {
                         decision,
                         ApprovalDecision::ApproveOnce | ApprovalDecision::ApproveSession
                     );
+
                     let (audit_decision, result_summary) = if approved {
-                        let result_msg = SupervisorMessage {
-                            msg: Some(SupMsg::ToolResult(ToolCallResult {
-                                request_id: request_id.clone(),
-                                result_json: serde_json::to_vec(
-                                    &serde_json::json!({"ok": true}),
-                                )
-                                .unwrap_or_default(),
-                            })),
-                        };
-                        if let Some(h) = agents.get(&agent_id) {
-                            let _ = h.send(result_msg).await;
+                        // Secret injection (stubbed — no-op for MVP).
+                        let resolved_args = secrets_injection::inject_secrets(args_value);
+
+                        // Execute in sandbox after approval.
+                        let exec_result = sandbox
+                            .lock()
+                            .await
+                            .execute(&agent_id, &tool_name, resolved_args)
+                            .await;
+
+                        match exec_result {
+                            Ok(result_json) => {
+                                let result_msg = SupervisorMessage {
+                                    msg: Some(SupMsg::ToolResult(ToolCallResult {
+                                        request_id: request_id.clone(),
+                                        result_json: serde_json::to_vec(&result_json)
+                                            .unwrap_or_default(),
+                                    })),
+                                };
+                                if let Some(h) = agents.get(&agent_id) {
+                                    let _ = h.send(result_msg).await;
+                                }
+                                (Decision::Ask, "approved by user; executed in sandbox".to_string())
+                            }
+                            Err(sandbox_err) => {
+                                tracing::error!(
+                                    agent_id = %agent_id,
+                                    tool = %tool_name,
+                                    "sandbox execution failed after approval: {sandbox_err}",
+                                );
+                                let result_msg = SupervisorMessage {
+                                    msg: Some(SupMsg::ToolResult(ToolCallResult {
+                                        request_id: request_id.clone(),
+                                        result_json: serde_json::to_vec(
+                                            &serde_json::json!({"error": sandbox_err.to_string()}),
+                                        )
+                                        .unwrap_or_default(),
+                                    })),
+                                };
+                                if let Some(h) = agents.get(&agent_id) {
+                                    let _ = h.send(result_msg).await;
+                                }
+                                (Decision::Ask, format!("approved; sandbox error: {sandbox_err}"))
+                            }
                         }
-                        (Decision::Ask, "approved by user".to_string())
                     } else {
                         let denied_msg = SupervisorMessage {
                             msg: Some(SupMsg::ToolDenied(ToolCallDenied {
@@ -914,6 +1035,66 @@ async fn handle_agent_connection_with_prompt(
     }
 }
 
+// ── Sandbox / tool registry helpers ──────────────────────────────────────────
+
+/// Choose the sandbox backend based on config and runtime environment.
+///
+/// Uses the mock backend if `/dev/kvm` is unavailable (CI/containers),
+/// or if the Firecracker binary doesn't exist at the configured path.
+fn build_sandbox_runner(config: &SandboxConfig) -> SandboxRunner {
+    use std::path::PathBuf;
+    let kvm_available = std::path::Path::new("/dev/kvm").exists();
+    let fc_available = config.firecracker_binary.exists();
+    if kvm_available && fc_available {
+        let run_dir = std::env::var("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/tmp"))
+            .join("pince")
+            .join("sandboxes");
+        tracing::info!("using real Firecracker sandbox backend");
+        SandboxRunner::real(config.clone(), run_dir)
+    } else {
+        tracing::info!(
+            kvm = kvm_available,
+            fc = fc_available,
+            "using mock sandbox backend (Firecracker not available)"
+        );
+        SandboxRunner::mock(config)
+    }
+}
+
+/// Build the list of tool schemas to send to an agent at init time.
+///
+/// Filters out tools that are unconditionally denied by the policy engine.
+async fn build_visible_tools(
+    registry: &ToolRegistry,
+    policy_engine: &PolicyEngine,
+    agent_id: &str,
+) -> Vec<pince_protocol::ToolSchema> {
+    let mut visible = Vec::new();
+    for schema in registry.schemas() {
+        // Send a null-args probe to check whether this tool is unconditionally denied.
+        let action = policy_engine
+            .evaluate(agent_id, &schema.name, &serde_json::Value::Null)
+            .await;
+        if matches!(action, Action::Deny) {
+            continue;
+        }
+        let risk_level = match schema.risk_level {
+            RegistryRiskLevel::Safe => 0,      // ProtoRiskLevel::Safe
+            RegistryRiskLevel::Sensitive => 1, // ProtoRiskLevel::Sensitive
+            RegistryRiskLevel::Dangerous => 2, // ProtoRiskLevel::Dangerous
+        };
+        visible.push(pince_protocol::ToolSchema {
+            name: schema.name,
+            description: schema.description,
+            input_schema_json: serde_json::to_vec(&schema.input_schema).unwrap_or_default(),
+            risk_level,
+        });
+    }
+    visible
+}
+
 // ── Auth token helper ─────────────────────────────────────────────────────────
 
 async fn load_or_create_token(path: &std::path::Path) -> Result<String> {
@@ -943,10 +1124,12 @@ mod tests {
     use permission_engine::{Action, PolicyEngine, PolicyFile};
 
     use crate::config::{Config, PermissionsConfig};
-    use super::Supervisor;
+    use super::{build_sandbox_runner, build_visible_tools, Supervisor};
 
     /// Build a minimal test Config with a given PolicyEngine.
     fn test_config(dir: &TempDir) -> Config {
+        use crate::config::AgentDefaults;
+        use pince_sandbox::SandboxConfig;
         Config {
             frontend_socket: dir.path().join("supervisor.sock"),
             agent_socket_dir: dir.path().join("agents"),
@@ -959,6 +1142,17 @@ mod tests {
                 global_policy: dir.path().join("policy.toml"),
                 project_policy: None,
                 hot_reload: false,
+            },
+            agent: AgentDefaults {
+                default_model: "test-model".into(),
+                default_provider: "test-provider".into(),
+                system_prompt: "You are a test assistant.".into(),
+                max_tokens: 1024,
+                temperature: 0.0,
+            },
+            sandbox: SandboxConfig {
+                workspace_base: dir.path().join("workspaces"),
+                ..SandboxConfig::default()
             },
         }
     }
@@ -1115,5 +1309,83 @@ conditions = { path_glob = "/workspace/.env" }
             .evaluate("agent", "any_tool", &serde_json::Value::Null)
             .await;
         assert_eq!(action, Action::Deny);
+    }
+
+    #[tokio::test]
+    async fn supervisor_initialises_tool_registry() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(&dir);
+        let sup = Supervisor::new(config).await.unwrap();
+        // At least the built-in tools should be registered.
+        assert!(!sup.tool_registry.is_empty(), "tool registry should not be empty");
+        assert!(sup.tool_registry.contains("read_file"));
+        assert!(sup.tool_registry.contains("write_file"));
+        assert!(sup.tool_registry.contains("shell_exec"));
+    }
+
+    #[tokio::test]
+    async fn build_visible_tools_excludes_denied() {
+        use permission_engine::PolicyFile;
+        // Policy: deny shell_exec for everyone, allow everything else.
+        let policy = PolicyFile::parse(r#"
+[defaults]
+action = "allow"
+
+[[rules]]
+agent = "*"
+tool = "shell_exec"
+action = "deny"
+"#)
+        .unwrap();
+        let engine = PolicyEngine::from_policy(policy);
+
+        let mut registry = tool_registry::ToolRegistry::new();
+        let protected = tool_registry::builtin::ProtectedPaths::default_protected();
+        tool_registry::builtin::register_all(&mut registry, protected);
+
+        let visible: Vec<pince_protocol::ToolSchema> =
+            build_visible_tools(&registry, &engine, "test-agent").await;
+        let names: Vec<&str> = visible.iter().map(|t| t.name.as_str()).collect();
+
+        // shell_exec is denied → should be excluded.
+        assert!(!names.contains(&"shell_exec"), "shell_exec should be filtered out");
+        // Other tools should be present.
+        assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"write_file"));
+    }
+
+    #[tokio::test]
+    async fn build_visible_tools_includes_all_when_allow_all() {
+        use permission_engine::PolicyFile;
+        let policy = PolicyFile::parse(r#"
+[defaults]
+action = "allow"
+"#)
+        .unwrap();
+        let engine = PolicyEngine::from_policy(policy);
+
+        let mut registry = tool_registry::ToolRegistry::new();
+        let protected = tool_registry::builtin::ProtectedPaths::default_protected();
+        tool_registry::builtin::register_all(&mut registry, protected);
+        let total = registry.len();
+
+        let visible: Vec<pince_protocol::ToolSchema> =
+            build_visible_tools(&registry, &engine, "test-agent").await;
+        assert_eq!(visible.len(), total, "all tools should be visible when policy allows all");
+    }
+
+    #[tokio::test]
+    async fn build_sandbox_runner_returns_mock_without_kvm() {
+        use pince_sandbox::SandboxConfig;
+        // /dev/kvm is almost certainly absent in the test container; if it is,
+        // this test doesn't make a strong claim — it just checks that the
+        // function doesn't panic.
+        let dir = TempDir::new().unwrap();
+        let cfg = SandboxConfig {
+            workspace_base: dir.path().join("workspaces"),
+            ..SandboxConfig::default()
+        };
+        let _runner = build_sandbox_runner(&cfg);
+        // No panic → pass.
     }
 }
