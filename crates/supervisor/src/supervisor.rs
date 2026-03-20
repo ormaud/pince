@@ -6,6 +6,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use permission_engine::{Action, PolicyEngine};
+use permission_engine::reload::{watch_and_reload, ReloadGuard};
+
 use anyhow::{Context, Result};
 use tokio::{
     net::UnixListener,
@@ -92,6 +95,11 @@ pub struct Supervisor {
     started_at: Instant,
     /// Number of registered (enabled) cron jobs.
     scheduler_jobs: usize,
+    /// Permission policy engine for evaluating tool calls.
+    policy_engine: Arc<PolicyEngine>,
+    /// Hot-reload guard — kept alive for the supervisor's lifetime.
+    #[allow(dead_code)]
+    reload_guard: Option<ReloadGuard>,
 }
 
 impl Supervisor {
@@ -99,6 +107,16 @@ impl Supervisor {
         let auth_token = load_or_create_token(&config.auth_token_file).await?;
         let audit = Arc::new(AuditLog::new(config.audit_log.clone()));
         let scheduler_jobs = config.cron_jobs.len();
+
+        // Load the permission policy engine.
+        let policy_engine = Arc::new(
+            PolicyEngine::load(
+                &config.permissions.global_policy,
+                config.permissions.project_policy.as_deref(),
+            )
+            .context("loading permission policy")?,
+        );
+
         Ok(Self {
             config,
             audit,
@@ -110,6 +128,8 @@ impl Supervisor {
             headless_agents: HashMap::new(),
             started_at: Instant::now(),
             scheduler_jobs,
+            policy_engine,
+            reload_guard: None,
         })
     }
 
@@ -122,6 +142,23 @@ impl Supervisor {
         let listener = UnixListener::bind(&self.config.frontend_socket)
             .context("binding frontend socket")?;
         tracing::info!(socket = ?self.config.frontend_socket, "supervisor listening");
+
+        // Start hot-reload watcher for policy files (if enabled).
+        if self.config.permissions.hot_reload {
+            match watch_and_reload(
+                self.policy_engine.clone(),
+                self.config.permissions.global_policy.clone(),
+                self.config.permissions.project_policy.clone(),
+            ) {
+                Ok(guard) => {
+                    self.reload_guard = Some(guard);
+                    tracing::info!("policy hot-reload watcher started");
+                }
+                Err(e) => {
+                    tracing::warn!("could not start policy hot-reload watcher: {e}");
+                }
+            }
+        }
 
         let (ev_tx, mut ev_rx) = mpsc::channel::<Event>(256);
 
@@ -332,6 +369,15 @@ impl Supervisor {
                 if let Some(pending) = self.pending_approvals.remove(&resp.request_id) {
                     let decision = ApprovalDecision::try_from(resp.decision)
                         .unwrap_or(ApprovalDecision::Deny);
+                    // If approved for the session, add a session overlay rule.
+                    if decision == ApprovalDecision::ApproveSession {
+                        self.policy_engine
+                            .add_session_allow(
+                                Some(pending.agent_id.clone()),
+                                pending.tool_call.tool.clone(),
+                            )
+                            .await;
+                    }
                     let _ = pending.resolve.send(decision);
                 }
             }
@@ -565,45 +611,23 @@ impl Supervisor {
         tool_call: ToolCallRequest,
     ) -> Result<()> {
         let request_id = tool_call.request_id.clone();
+        let tool_name = tool_call.tool.clone();
         let args_summary = String::from_utf8_lossy(&tool_call.arguments_json).to_string();
 
-        // Broadcast approval request to all frontends.
-        self.broadcast_frontend(SupervisorFrontendMessage {
-            msg: Some(SupFrontMsg::ApprovalRequest(
-                frontend_types::ApprovalRequest {
-                    request_id: request_id.clone(),
-                    agent_id: agent_id.clone(),
-                    tool: tool_call.tool.clone(),
-                    arguments_json: tool_call.arguments_json.clone(),
-                    risk_level: 0,
-                },
-            )),
-        })
-        .await;
+        // Parse arguments for policy evaluation.
+        let args_value: serde_json::Value =
+            serde_json::from_slice(&tool_call.arguments_json).unwrap_or(serde_json::Value::Null);
 
-        // Register pending approval.
-        let (resolve_tx, resolve_rx) = tokio::sync::oneshot::channel::<ApprovalDecision>();
-        let tool_name = tool_call.tool.clone();
-        self.pending_approvals.insert(
-            request_id.clone(),
-            PendingApproval {
-                agent_id: agent_id.clone(),
-                tool_call,
-                resolve: resolve_tx,
-            },
-        );
+        // Evaluate policy.
+        let policy_action = self
+            .policy_engine
+            .evaluate(&agent_id, &tool_name, &args_value)
+            .await;
 
-        // Spawn resolver task.
-        let audit = self.audit.clone();
-        let agents = self.agents.clone();
-
-        tokio::spawn(async move {
-            let decision = resolve_rx.await.unwrap_or(ApprovalDecision::Deny);
-            let approved = matches!(
-                decision,
-                ApprovalDecision::ApproveOnce | ApprovalDecision::ApproveSession
-            );
-            let (audit_decision, result_summary) = if approved {
+        match policy_action {
+            Action::Allow => {
+                // Allowed by policy — proceed immediately, no user prompt.
+                tracing::info!(agent_id = %agent_id, tool = %tool_name, "policy: allow");
                 let result_msg = SupervisorMessage {
                     msg: Some(SupMsg::ToolResult(ToolCallResult {
                         request_id: request_id.clone(),
@@ -611,29 +635,110 @@ impl Supervisor {
                             .unwrap_or_default(),
                     })),
                 };
-                if let Some(h) = agents.get(&agent_id) {
+                if let Some(h) = self.agents.get(&agent_id) {
                     let _ = h.send(result_msg).await;
                 }
-                (Decision::Ask, "approved".to_string())
-            } else {
+                let entry = AuditEntry::new(
+                    &agent_id, &tool_name, &args_summary, Decision::Allow, "policy: allow",
+                );
+                if let Err(e) = self.audit.append(entry).await {
+                    tracing::error!("audit log: {e}");
+                }
+            }
+
+            Action::Deny => {
+                // Denied by policy — reject immediately, no user prompt.
+                tracing::info!(agent_id = %agent_id, tool = %tool_name, "policy: deny");
                 let denied_msg = SupervisorMessage {
                     msg: Some(SupMsg::ToolDenied(ToolCallDenied {
-                        request_id,
-                        reason: "denied by user".into(),
+                        request_id: request_id.clone(),
+                        reason: "denied by policy".into(),
                     })),
                 };
-                if let Some(h) = agents.get(&agent_id) {
+                if let Some(h) = self.agents.get(&agent_id) {
                     let _ = h.send(denied_msg).await;
                 }
-                (Decision::Deny, "denied".to_string())
-            };
-
-            let entry =
-                AuditEntry::new(agent_id, &tool_name, &args_summary, audit_decision, result_summary);
-            if let Err(e) = audit.append(entry).await {
-                tracing::error!("audit log: {e}");
+                let entry = AuditEntry::new(
+                    &agent_id, &tool_name, &args_summary, Decision::Deny, "policy: deny",
+                );
+                if let Err(e) = self.audit.append(entry).await {
+                    tracing::error!("audit log: {e}");
+                }
             }
-        });
+
+            Action::Ask => {
+                // Policy says ask the user — broadcast approval request to frontends.
+                tracing::info!(agent_id = %agent_id, tool = %tool_name, "policy: ask (prompting user)");
+                self.broadcast_frontend(SupervisorFrontendMessage {
+                    msg: Some(SupFrontMsg::ApprovalRequest(
+                        frontend_types::ApprovalRequest {
+                            request_id: request_id.clone(),
+                            agent_id: agent_id.clone(),
+                            tool: tool_name.clone(),
+                            arguments_json: tool_call.arguments_json.clone(),
+                            risk_level: 0,
+                        },
+                    )),
+                })
+                .await;
+
+                // Register pending approval.
+                let (resolve_tx, resolve_rx) = tokio::sync::oneshot::channel::<ApprovalDecision>();
+                self.pending_approvals.insert(
+                    request_id.clone(),
+                    PendingApproval {
+                        agent_id: agent_id.clone(),
+                        tool_call,
+                        resolve: resolve_tx,
+                    },
+                );
+
+                // Spawn resolver task.
+                let audit = self.audit.clone();
+                let agents = self.agents.clone();
+
+                tokio::spawn(async move {
+                    let decision = resolve_rx.await.unwrap_or(ApprovalDecision::Deny);
+                    let approved = matches!(
+                        decision,
+                        ApprovalDecision::ApproveOnce | ApprovalDecision::ApproveSession
+                    );
+                    let (audit_decision, result_summary) = if approved {
+                        let result_msg = SupervisorMessage {
+                            msg: Some(SupMsg::ToolResult(ToolCallResult {
+                                request_id: request_id.clone(),
+                                result_json: serde_json::to_vec(
+                                    &serde_json::json!({"ok": true}),
+                                )
+                                .unwrap_or_default(),
+                            })),
+                        };
+                        if let Some(h) = agents.get(&agent_id) {
+                            let _ = h.send(result_msg).await;
+                        }
+                        (Decision::Ask, "approved by user".to_string())
+                    } else {
+                        let denied_msg = SupervisorMessage {
+                            msg: Some(SupMsg::ToolDenied(ToolCallDenied {
+                                request_id,
+                                reason: "denied by user".into(),
+                            })),
+                        };
+                        if let Some(h) = agents.get(&agent_id) {
+                            let _ = h.send(denied_msg).await;
+                        }
+                        (Decision::Deny, "denied by user".to_string())
+                    };
+
+                    let entry = AuditEntry::new(
+                        agent_id, &tool_name, &args_summary, audit_decision, result_summary,
+                    );
+                    if let Err(e) = audit.append(entry).await {
+                        tracing::error!("audit log: {e}");
+                    }
+                });
+            }
+        }
 
         Ok(())
     }
@@ -828,5 +933,187 @@ async fn load_or_create_token(path: &std::path::Path) -> Result<String> {
             tracing::info!(path = ?path, "created auth token");
             Ok(token)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+
+    use permission_engine::{Action, PolicyEngine, PolicyFile};
+
+    use crate::config::{Config, PermissionsConfig};
+    use super::Supervisor;
+
+    /// Build a minimal test Config with a given PolicyEngine.
+    fn test_config(dir: &TempDir) -> Config {
+        Config {
+            frontend_socket: dir.path().join("supervisor.sock"),
+            agent_socket_dir: dir.path().join("agents"),
+            auth_token_file: dir.path().join("auth_token"),
+            audit_log: dir.path().join("audit.jsonl"),
+            heartbeat_timeout_secs: 30,
+            config_file: dir.path().join("supervisor.toml"),
+            cron_jobs: vec![],
+            permissions: PermissionsConfig {
+                global_policy: dir.path().join("policy.toml"),
+                project_policy: None,
+                hot_reload: false,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_allow_action() {
+        let policy = PolicyFile::parse(r#"
+[defaults]
+action = "deny"
+
+[[rules]]
+agent = "*"
+tool = "read_file"
+action = "allow"
+"#)
+        .unwrap();
+        let engine = PolicyEngine::from_policy(policy);
+        let action = engine
+            .evaluate("test-agent", "read_file", &serde_json::Value::Null)
+            .await;
+        assert_eq!(action, Action::Allow);
+    }
+
+    #[tokio::test]
+    async fn policy_deny_action() {
+        let policy = PolicyFile::parse(r#"
+[defaults]
+action = "ask"
+
+[[rules]]
+agent = "*"
+tool = "shell_exec"
+action = "deny"
+"#)
+        .unwrap();
+        let engine = PolicyEngine::from_policy(policy);
+        let action = engine
+            .evaluate("test-agent", "shell_exec", &serde_json::Value::Null)
+            .await;
+        assert_eq!(action, Action::Deny);
+    }
+
+    #[tokio::test]
+    async fn policy_ask_action() {
+        let policy = PolicyFile::parse(r#"
+[defaults]
+action = "allow"
+
+[[rules]]
+agent = "*"
+tool = "write_file"
+action = "ask"
+"#)
+        .unwrap();
+        let engine = PolicyEngine::from_policy(policy);
+        let action = engine
+            .evaluate("test-agent", "write_file", &serde_json::Value::Null)
+            .await;
+        assert_eq!(action, Action::Ask);
+    }
+
+    #[tokio::test]
+    async fn policy_default_deny_unknown_tool() {
+        let policy = PolicyFile::parse(r#"
+[defaults]
+action = "deny"
+
+[[rules]]
+agent = "*"
+tool = "read_file"
+action = "allow"
+"#)
+        .unwrap();
+        let engine = PolicyEngine::from_policy(policy);
+        // shell_exec has no rule → hits default deny
+        let action = engine
+            .evaluate("test-agent", "shell_exec", &serde_json::Value::Null)
+            .await;
+        assert_eq!(action, Action::Deny);
+    }
+
+    #[tokio::test]
+    async fn session_overlay_overrides_deny() {
+        let policy = PolicyFile::parse(r#"
+[defaults]
+action = "deny"
+
+[[rules]]
+agent = "*"
+tool = "shell_exec"
+action = "deny"
+"#)
+        .unwrap();
+        let engine = PolicyEngine::from_policy(policy);
+        // Normally denied…
+        let before = engine
+            .evaluate("test-agent", "shell_exec", &serde_json::Value::Null)
+            .await;
+        assert_eq!(before, Action::Deny);
+
+        // Add a session overlay allow.
+        engine
+            .add_session_allow(Some("test-agent".to_string()), "shell_exec".to_string())
+            .await;
+
+        // Now it should be allowed.
+        let after = engine
+            .evaluate("test-agent", "shell_exec", &serde_json::Value::Null)
+            .await;
+        assert_eq!(after, Action::Allow);
+    }
+
+    #[tokio::test]
+    async fn policy_condition_path_glob() {
+        let policy = PolicyFile::parse(r#"
+[defaults]
+action = "deny"
+
+[[rules]]
+agent = "*"
+tool = "write_file"
+action = "allow"
+conditions = { path_glob = "/workspace/**" }
+
+[[rules]]
+agent = "*"
+tool = "write_file"
+action = "deny"
+conditions = { path_glob = "/workspace/.env" }
+"#)
+        .unwrap();
+        let engine = PolicyEngine::from_policy(policy);
+
+        // Allowed: inside workspace
+        let args_ok = serde_json::json!({"path": "/workspace/src/main.rs"});
+        let action = engine.evaluate("agent", "write_file", &args_ok).await;
+        assert_eq!(action, Action::Allow);
+
+        // Denied by default (no matching rule): outside workspace
+        let args_outside = serde_json::json!({"path": "/etc/passwd"});
+        let action = engine.evaluate("agent", "write_file", &args_outside).await;
+        assert_eq!(action, Action::Deny);
+    }
+
+    #[tokio::test]
+    async fn supervisor_loads_empty_policy_file() {
+        let dir = TempDir::new().unwrap();
+        let config = test_config(&dir);
+        // global_policy path does not exist → PolicyEngine::load uses empty default
+        let sup = Supervisor::new(config).await.unwrap();
+        // Verify the engine starts with default (deny-all) when no file exists.
+        let action = sup
+            .policy_engine
+            .evaluate("agent", "any_tool", &serde_json::Value::Null)
+            .await;
+        assert_eq!(action, Action::Deny);
     }
 }

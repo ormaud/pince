@@ -16,7 +16,7 @@ use pince_protocol::{
         supervisor_frontend_message::Msg as SupFrontMsg,
     },
 };
-use supervisor_lib::{config::Config, supervisor::Supervisor};
+use supervisor_lib::{config::{Config, PermissionsConfig}, supervisor::Supervisor};
 
 /// Spawn a supervisor in a background task. Returns (socket_path, auth_token).
 async fn start_supervisor(dir: &TempDir) -> (std::path::PathBuf, String) {
@@ -36,6 +36,11 @@ async fn start_supervisor(dir: &TempDir) -> (std::path::PathBuf, String) {
         heartbeat_timeout_secs: 10,
         config_file: dir.path().join("supervisor.toml"),
         cron_jobs: Vec::new(),
+        permissions: PermissionsConfig {
+            global_policy: dir.path().join("policy.toml"),
+            project_policy: None,
+            hot_reload: false,
+        },
     };
 
     tokio::spawn(async move {
