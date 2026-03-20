@@ -16,7 +16,8 @@ use pince_protocol::{
         supervisor_frontend_message::Msg as SupFrontMsg,
     },
 };
-use supervisor_lib::{config::{Config, PermissionsConfig}, supervisor::Supervisor};
+use pince_sandbox::SandboxConfig;
+use supervisor_lib::{config::{AgentDefaults, Config, PermissionsConfig}, supervisor::Supervisor};
 
 /// Spawn a supervisor in a background task. Returns (socket_path, auth_token).
 async fn start_supervisor(dir: &TempDir) -> (std::path::PathBuf, String) {
@@ -40,6 +41,17 @@ async fn start_supervisor(dir: &TempDir) -> (std::path::PathBuf, String) {
             global_policy: dir.path().join("policy.toml"),
             project_policy: None,
             hot_reload: false,
+        },
+        agent: AgentDefaults {
+            default_model: "test-model".into(),
+            default_provider: "test-provider".into(),
+            system_prompt: "You are a test assistant.".into(),
+            max_tokens: 1024,
+            temperature: 0.0,
+        },
+        sandbox: SandboxConfig {
+            workspace_base: dir.path().join("workspaces"),
+            ..SandboxConfig::default()
         },
     };
 

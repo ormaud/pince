@@ -42,6 +42,7 @@ pub mod error;
 pub mod manager;
 pub mod mock;
 pub mod protocol;
+pub mod runner;
 
 // Internal modules (not part of public API).
 pub(crate) mod firecracker;
@@ -52,3 +53,4 @@ pub use config::SandboxConfig;
 pub use error::SandboxError;
 pub use manager::SandboxManager;
 pub use mock::MockSandboxManager;
+pub use runner::SandboxRunner;

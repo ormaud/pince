@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+use pince_sandbox::SandboxConfig;
 use pince_scheduler::CronJob;
 
 /// Top-level TOML config structure.
@@ -19,6 +20,30 @@ struct TomlConfig {
     cron_jobs: Vec<CronJob>,
     #[serde(default)]
     permissions: TomlPermissionsConfig,
+    #[serde(default)]
+    agent: TomlAgentConfig,
+    #[serde(default)]
+    sandbox: SandboxConfig,
+}
+
+/// TOML `[agent]` section — defaults for spawned agents.
+#[derive(Debug, Default, Deserialize)]
+struct TomlAgentConfig {
+    default_model: Option<String>,
+    default_provider: Option<String>,
+    system_prompt: Option<String>,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+}
+
+/// Agent defaults resolved from TOML and env.
+#[derive(Debug, Clone)]
+pub struct AgentDefaults {
+    pub default_model: String,
+    pub default_provider: String,
+    pub system_prompt: String,
+    pub max_tokens: u32,
+    pub temperature: f32,
 }
 
 /// TOML permissions section.
@@ -69,6 +94,10 @@ pub struct Config {
     pub cron_jobs: Vec<CronJob>,
     /// Permission engine configuration.
     pub permissions: PermissionsConfig,
+    /// Agent defaults (model, provider, system prompt, etc.).
+    pub agent: AgentDefaults,
+    /// Sandbox runtime configuration.
+    pub sandbox: SandboxConfig,
 }
 
 impl Config {
@@ -118,6 +147,23 @@ impl Config {
 
         let hot_reload = toml_cfg.permissions.hot_reload.unwrap_or(true);
 
+        let agent = AgentDefaults {
+            default_model: toml_cfg
+                .agent
+                .default_model
+                .unwrap_or_else(|| "claude-sonnet-4-20250514".to_string()),
+            default_provider: toml_cfg
+                .agent
+                .default_provider
+                .unwrap_or_else(|| "anthropic".to_string()),
+            system_prompt: toml_cfg
+                .agent
+                .system_prompt
+                .unwrap_or_else(|| "You are a helpful assistant.".to_string()),
+            max_tokens: toml_cfg.agent.max_tokens.unwrap_or(4096),
+            temperature: toml_cfg.agent.temperature.unwrap_or(0.7),
+        };
+
         Self {
             frontend_socket: std::env::var("PINCE_FRONTEND_SOCKET")
                 .map(PathBuf::from)
@@ -143,6 +189,8 @@ impl Config {
                 project_policy,
                 hot_reload,
             },
+            agent,
+            sandbox: toml_cfg.sandbox,
         }
     }
 }

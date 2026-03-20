@@ -40,6 +40,15 @@ impl ToolRegistry {
         schemas
     }
 
+    /// Validate arguments against the tool's JSON Schema without executing.
+    ///
+    /// Returns `ToolError::NotFound` if the tool doesn't exist.
+    /// Returns `ToolError::InvalidArguments` if the args fail schema validation.
+    pub fn validate(&self, name: &str, args: &Value) -> Result<(), ToolError> {
+        let tool = self.tools.get(name).ok_or_else(|| ToolError::NotFound(name.to_string()))?;
+        validate::validate(&tool.schema.input_schema, args)
+    }
+
     /// Validate arguments against the tool's JSON Schema, then execute the handler.
     ///
     /// Returns `ToolError::NotFound` if the tool doesn't exist.
