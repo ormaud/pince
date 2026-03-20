@@ -63,10 +63,9 @@ else
 
   curl -fsSL "$BASE/AGENTS.md" -o "$SCRIPT_DIR/AGENTS.md"
 
-  # prompt.md is user-customizable — only download if missing
-  if [ ! -f "$SCRIPT_DIR/prompt.md" ]; then
-    curl -fsSL "$BASE/prompt.md" -o "$SCRIPT_DIR/prompt.md"
-  fi
+  curl -fsSL "$BASE/prompt.md" -o "$SCRIPT_DIR/prompt.md"
+
+  curl -fsSL "$BASE/reviewer-prompt.md" -o "$SCRIPT_DIR/reviewer-prompt.md"
 
   PROJECT_DIR="$SCRIPT_DIR/.."
   mkdir -p "$PROJECT_DIR/.claude/agents"

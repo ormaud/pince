@@ -1,15 +1,15 @@
-If the TRAME_AGENT_ID environment variable is set, call `register_agent` with agent_id=TRAME_AGENT_ID, label=AGENT_LABEL, and model=MODEL from the environment. This registers your agent session heartbeat.
-
 Study project specs.
 
-If you don't have an implementation plan claimed on trame, claim one (pass your agent session id if registered).
+If you don't have an implementation plan claimed on trame, claim one using `claim_plan`.
 If there are no plans available to claim, create a file named `/tmp/.no-plan` and stop.
 
-Once you have a claimed plan, set up your worktree by running:
+`claim_plan` returns the plan spec, branch name, feature/project context, and review feedback (if rework). Use the returned branch name to set up your worktree by running:
+
 ```
-denv/setup-worktree.sh "<plan title>"
+denv/setup-worktree.sh "<branch name>"
 ```
-This creates (or reuses) a git worktree with a branch derived from the plan title. It prints the worktree path — `cd` into it and do ALL your work there.
+
+This creates (or reuses) a git worktree for that branch. It prints the worktree path — `cd` into it and do ALL your work there.
 
 Study your claimed implementation plan and work on the most important task.
 
@@ -19,5 +19,4 @@ IMPORTANT:
 - Read and write files directly using Read, Edit, Write tools
 - Author tests and run them
 - After changes pass tests, commit your work to the worktree branch
-- Update your implementation plan status on trame as you progress
-- When all tasks are complete, set the plan status to completed
+- When all tasks are complete, push your branch and call `submit_work` with the plan ID to submit for review
