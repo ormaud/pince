@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 pince-protocol = { path = "../protocol" }
 pince-scheduler = { path = "../scheduler" }
+permission-engine = { path = "../permission-engine" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -17,6 +17,37 @@ struct TomlConfig {
     heartbeat_timeout_secs: Option<u64>,
     #[serde(default)]
     cron_jobs: Vec<CronJob>,
+    #[serde(default)]
+    permissions: TomlPermissionsConfig,
+}
+
+/// TOML permissions section.
+#[derive(Debug, Deserialize)]
+struct TomlPermissionsConfig {
+    global_policy: Option<String>,
+    project_policy: Option<String>,
+    hot_reload: Option<bool>,
+}
+
+impl Default for TomlPermissionsConfig {
+    fn default() -> Self {
+        Self {
+            global_policy: None,
+            project_policy: None,
+            hot_reload: Some(true),
+        }
+    }
+}
+
+/// Permissions configuration resolved from TOML and env.
+#[derive(Debug, Clone)]
+pub struct PermissionsConfig {
+    /// Path to the global policy TOML file.
+    pub global_policy: PathBuf,
+    /// Optional path to the project-local policy TOML file.
+    pub project_policy: Option<PathBuf>,
+    /// Whether to watch policy files for hot-reload.
+    pub hot_reload: bool,
 }
 
 /// Supervisor runtime configuration.
@@ -36,6 +67,8 @@ pub struct Config {
     pub config_file: PathBuf,
     /// Cron jobs loaded from the TOML config.
     pub cron_jobs: Vec<CronJob>,
+    /// Permission engine configuration.
+    pub permissions: PermissionsConfig,
 }
 
 impl Config {
@@ -58,6 +91,33 @@ impl Config {
         // Load TOML config if present.
         let toml_cfg = load_toml(&config_file);
 
+        let global_policy = std::env::var("PINCE_GLOBAL_POLICY")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                toml_cfg
+                    .permissions
+                    .global_policy
+                    .as_deref()
+                    .map(expand_tilde)
+                    .unwrap_or_else(|| config_dir.join("pince").join("policy.toml"))
+            });
+
+        let project_policy = std::env::var("PINCE_PROJECT_POLICY")
+            .map(|s| Some(PathBuf::from(s)))
+            .unwrap_or_else(|_| {
+                toml_cfg
+                    .permissions
+                    .project_policy
+                    .as_deref()
+                    .map(expand_tilde)
+                    .or_else(|| {
+                        // Default: .pince/policy.toml relative to CWD.
+                        Some(PathBuf::from(".pince/policy.toml"))
+                    })
+            });
+
+        let hot_reload = toml_cfg.permissions.hot_reload.unwrap_or(true);
+
         Self {
             frontend_socket: std::env::var("PINCE_FRONTEND_SOCKET")
                 .map(PathBuf::from)
@@ -78,6 +138,11 @@ impl Config {
                 .unwrap_or(30),
             cron_jobs: toml_cfg.cron_jobs,
             config_file,
+            permissions: PermissionsConfig {
+                global_policy,
+                project_policy,
+                hot_reload,
+            },
         }
     }
 }
@@ -103,6 +168,15 @@ fn dirs_home() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/tmp"))
+}
+
+/// Expand a leading `~/` to the user's home directory.
+fn expand_tilde(s: &str) -> PathBuf {
+    if let Some(rest) = s.strip_prefix("~/") {
+        dirs_home().join(rest)
+    } else {
+        PathBuf::from(s)
+    }
 }
 
 #[cfg(test)]
